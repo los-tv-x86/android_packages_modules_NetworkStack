@@ -42,6 +42,10 @@ namespace android {
 constexpr const char NETWORKSTACKUTILS_PKG_NAME[] =
     "com/android/networkstack/util/NetworkStackUtils";
 
+static const uint32_t kEtherHeaderLen = sizeof(ether_header);
+static const uint32_t kIPv4Protocol = kEtherHeaderLen + offsetof(iphdr, protocol);
+static const uint32_t kIPv4FlagsOffset = kEtherHeaderLen + offsetof(iphdr, frag_off);
+static const uint32_t kUDPDstPortIndirectOffset = kEtherHeaderLen + offsetof(udphdr, dest);
 static const uint16_t kDhcpClientPort = 68;
 
 static bool checkLenAndCopy(JNIEnv* env, const jbyteArray& addr, int len, void* dst) {
@@ -96,21 +100,25 @@ static void network_stack_utils_addArpEntry(JNIEnv *env, jclass clazz, jbyteArra
 static void network_stack_utils_attachDhcpFilter(JNIEnv *env, jclass clazz, jobject javaFd) {
     static sock_filter filter_code[] = {
         // Check the protocol is UDP.
-        BPF_LOAD_IPV4_U8(protocol),
-        BPF2_REJECT_IF_NOT_EQUAL(IPPROTO_UDP),
+        BPF_STMT(BPF_LD  | BPF_B    | BPF_ABS, kIPv4Protocol),
+        BPF_JUMP(BPF_JMP | BPF_JEQ  | BPF_K,   IPPROTO_UDP, 0, 6),
 
         // Check this is not a fragment.
-        BPF_LOAD_IPV4_BE16(frag_off),
-        BPF2_REJECT_IF_ANY_MASKED_BITS_SET(IP_MF | IP_OFFMASK),
+        BPF_STMT(BPF_LD  | BPF_H    | BPF_ABS, kIPv4FlagsOffset),
+        BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K,   IP_MF | IP_OFFMASK, 4, 0),
 
         // Get the IP header length.
-        BPF_LOADX_NET_RELATIVE_IPV4_HLEN,
+        BPF_STMT(BPF_LDX | BPF_B    | BPF_MSH, kEtherHeaderLen),
 
         // Check the destination port.
-        BPF_LOAD_NETX_RELATIVE_DST_PORT,
-        BPF2_REJECT_IF_NOT_EQUAL(kDhcpClientPort),
+        BPF_STMT(BPF_LD  | BPF_H    | BPF_IND, kUDPDstPortIndirectOffset),
+        BPF_JUMP(BPF_JMP | BPF_JEQ  | BPF_K,   kDhcpClientPort, 0, 1),
 
-        BPF_ACCEPT,
+        // Accept.
+        BPF_STMT(BPF_RET | BPF_K,              0xffff),
+
+        // Reject.
+        BPF_STMT(BPF_RET | BPF_K,              0)
     };
     const sock_fprog filter = {
         sizeof(filter_code) / sizeof(filter_code[0]),
